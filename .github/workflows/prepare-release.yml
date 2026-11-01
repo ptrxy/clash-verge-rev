@@ -1,0 +1,101 @@
+name: Prepare Release
+
+on:
+  pull_request_target:
+    types: [edited, closed]
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        type: choice
+        options: [rc, stable]
+        default: rc
+      release_tag:
+        description: 'Optional tag: vX.Y.Z-rc[.N] for RC, vX.Y.Z for stable'
+        required: false
+        type: string
+      migrate_pr:
+        description: 'Migration only: existing version PR targeting main to refresh and retarget to dev'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.changes.body && github.event.pull_request.state == 'open' &&
+           github.event.pull_request.head.repo.full_name == github.repository &&
+           github.event.pull_request.user.login == 'github-actions[bot]' &&
+           startsWith(github.event.pull_request.head.ref, 'release/v') &&
+           contains(github.event.pull_request.body, '[x] Refresh this PR from latest dev')) }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Require the dev branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          if [[ "$SOURCE_REF" != 'refs/heads/dev' ]]; then
+            echo '::error::Run Prepare Release from the dev branch.'
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/heads/dev
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26.13.0'
+
+      - name: Prepare candidate or return the existing PR
+        id: candidate
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          MIGRATE_PR: ${{ inputs.migrate_pr }}
+        run: node scripts-workflow/release.mjs prepare
+
+      - uses: pnpm/action-setup@v6
+        if: steps.candidate.outputs.release_tag != ''
+        with:
+          run_install: false
+
+      - name: Create signed candidate commit and create or refresh release PR
+        if: steps.candidate.outputs.release_tag != ''
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          node scripts-workflow/release.mjs create-pr
+
+  publication:
+    if: >-
+      ${{ github.event.action == 'closed' && github.event.pull_request.merged == true &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.user.login == 'github-actions[bot]' &&
+          startsWith(github.event.pull_request.head.ref, 'release/v') }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/heads/dev
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26.13.0'
+      - name: Create publication PR at the final version commit on dev
+        run: node scripts-workflow/release.mjs publish-pr
